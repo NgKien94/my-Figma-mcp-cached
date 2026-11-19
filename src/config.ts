@@ -30,6 +30,7 @@ function maskApiKey(key: string): string {
 
 interface CliArgs {
   "figma-api-key"?: string;
+  "figma-api-keys"?: string;
   "figma-oauth-token"?: string;
   env?: string;
   port?: number;
@@ -82,6 +83,10 @@ export function getServerConfig(isStdioMode: boolean): ServerConfig {
         type: "string",
         description: "Figma caching configuration as JSON string, e.g. '{\"ttl\":{\"value\":30,\"unit\":\"d\"}}'",
       },
+      "figma-api-keys": {
+        type: "string",
+        description: "PAT pool as comma-separated keys or JSON array",
+      },
     })
     .help()
     .version(process.env.NPM_PACKAGE_VERSION ?? "unknown")
@@ -108,6 +113,15 @@ export function getServerConfig(isStdioMode: boolean): ServerConfig {
     useOAuth: false,
   };
 
+  // Handle FIGMA_API_KEYS / --figma-api-keys (PAT fallback pool)
+  const configuredApiKeys = parseApiKeys(
+    argv["figma-api-keys"] ?? process.env.FIGMA_API_KEYS,
+  );
+  if (configuredApiKeys.length > 0) {
+    auth.figmaApiKeys = configuredApiKeys;
+    auth.figmaApiKey = configuredApiKeys[0];
+  }
+
   const config: Omit<ServerConfig, "auth"> = {
     port: 3333,
     outputFormat: "yaml",
@@ -124,13 +138,20 @@ export function getServerConfig(isStdioMode: boolean): ServerConfig {
     },
   };
 
-  // Handle FIGMA_API_KEY
-  if (argv["figma-api-key"]) {
-    auth.figmaApiKey = argv["figma-api-key"];
-    config.configSources.figmaApiKey = "cli";
-  } else if (process.env.FIGMA_API_KEY) {
-    auth.figmaApiKey = process.env.FIGMA_API_KEY;
-    config.configSources.figmaApiKey = "env";
+  // Handle FIGMA_API_KEY as a compatibility single-key option.
+  // When a PAT pool is configured, the pool takes precedence.
+  if (configuredApiKeys.length === 0) {
+    if (argv["figma-api-key"]) {
+      auth.figmaApiKey = argv["figma-api-key"];
+      config.configSources.figmaApiKey = "cli";
+    } else if (process.env.FIGMA_API_KEY) {
+      auth.figmaApiKey = process.env.FIGMA_API_KEY;
+      config.configSources.figmaApiKey = "env";
+    }
+  } else {
+    config.configSources.figmaApiKey = argv["figma-api-keys"]
+      ? "cli"
+      : "env";
   }
 
   // Handle FIGMA_OAUTH_TOKEN
@@ -218,6 +239,9 @@ export function getServerConfig(isStdioMode: boolean): ServerConfig {
     );
     console.log(
       `- FIGMA_CACHING: ${config.caching ? JSON.stringify({ cacheDir: config.caching.cacheDir, ttlMs: config.caching.ttlMs, autoCleanup: config.caching.autoCleanup ?? true, cleanupIntervalMs: config.caching.cleanupIntervalMs }) : "disabled"} (source: ${config.configSources.caching ?? "none"})`,
+    );
+    console.log(
+      `- FIGMA_API_KEY_POOL: ${auth.figmaApiKeys?.length ?? 1} PAT(s) configured`,
     );
     console.log(); // Empty line for better readability
   }
@@ -346,4 +370,28 @@ function getDefaultCacheDir(): string {
   // linux and others -> use XDG cache dir
   const xdgCache = process.env.XDG_CACHE_HOME || join(os.homedir(), ".cache");
   return join(xdgCache, "figma-mcp");
+}
+
+function parseApiKeys(rawValue: string | undefined): string[] {
+  if (!rawValue) return [];
+
+  const trimmed = rawValue.trim();
+  if (!trimmed) return [];
+
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (Array.isArray(parsed)) {
+      return [...new Set(parsed
+        .filter((key): key is string => typeof key === "string")
+        .map((key) => key.trim())
+        .filter(Boolean))];
+    }
+  } catch {
+    // Accept comma-separated PATs as a simpler fallback.
+  }
+
+  return [...new Set(trimmed
+    .split(",")
+    .map((key) => key.trim())
+    .filter(Boolean))];
 }

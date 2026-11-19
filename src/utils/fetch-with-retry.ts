@@ -37,23 +37,26 @@ export async function fetchWithRetry<T extends { status?: number }>(
 
       if (!response.ok) {
         const message = `Fetch failed with status ${response.status}: ${response.statusText}`;
-        // 只有 429 和 5xx 属于可重试的暂态错误，其余（如 400, 401, 403, 404 等）为致命错误，直接中断重试
-        if (response.status === 429 || response.status >= 500) {
-          throw new Error(message);
-        } else {
+        // 401/403/429 are authentication or quota failures and must not fall back to curl.
+        if (response.status === 401 || response.status === 403 || response.status === 429) {
           throw new FatalFetchError(message);
         }
+        // 只有 429 和 5xx 属于可重试的暂态错误，其余（如 400, 401, 403, 404 等）为致命错误，直接中断重试
+        if (response.status >= 500) {
+          throw new Error(message);
+        }
+        throw new FatalFetchError(message);
       }
       return (await response.json()) as T;
     } catch (fetchError: unknown) {
       lastError = fetchError;
-      
+
       const isFatal = fetchError instanceof FatalFetchError;
       if (isFatal) {
-        Logger.log(`[fetchWithRetry] Fatal error encountered: ${(fetchError as Error).message}. Skipping retries.`);
-        break; // 直接中断重试循环
+        Logger.log(`[fetchWithRetry] Fatal error encountered: ${(fetchError as Error).message}. Skipping retries and curl fallback.`);
+        throw fetchError;
       }
-      
+
       if (attempt < maxRetries) {
         const backoffDelay = Math.pow(2, attempt) * 300 + Math.random() * 100;
         Logger.log(
@@ -78,7 +81,14 @@ export async function fetchWithRetry<T extends { status?: number }>(
 
   try {
     // Fallback to curl for corporate networks that have proxies that sometimes block fetch
-    Logger.log(`[fetchWithRetry] Executing curl with args: ${JSON.stringify(curlArgs)}`);
+    const safeCurlArgs = curlArgs.map((arg) => {
+      if (/^(?:Bearer\s+|figma_pat_|figma_[a-zA-Z0-9_-])/i.test(arg) && arg.length > 8) {
+        return "****";
+      }
+      return arg;
+    });
+    Logger.log(`[fetchWithRetry] Executing curl fallback for ${url} with ${safeCurlArgs.filter((arg) => arg === "****").length} redacted header(s)`);
+
     const { stdout, stderr } = await execFileAsync("curl", curlArgs);
 
     if (stderr) {
@@ -109,8 +119,9 @@ export async function fetchWithRetry<T extends { status?: number }>(
     }
 
     return result;
-  } catch (curlError: any) {
-    Logger.error(`[fetchWithRetry] Curl fallback also failed for ${url}: ${curlError.message}`);
+  } catch (curlError: unknown) {
+    const message = curlError instanceof Error ? curlError.message : String(curlError);
+    Logger.error(`[fetchWithRetry] Curl fallback also failed for ${url}: ${message}`);
     // Re-throw the original fetch error to give context about the initial failure
     throw lastError;
   }

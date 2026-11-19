@@ -93,6 +93,87 @@ describe("FigmaService caching", () => {
       await cleanup(cacheDir);
     }
   });
+
+  it("falls back to the next PAT on authentication or quota errors", async () => {
+    const originalFetch = globalThis.fetch;
+    const seenKeys: string[] = [];
+
+    globalThis.fetch = jest.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const headers = init?.headers as Record<string, string>;
+      const key = headers?.["X-Figma-Token"] || "";
+      seenKeys.push(key);
+
+      if (key === "first-key") {
+        return new Response(JSON.stringify({ status: 401 }), {
+          status: 401,
+          statusText: "Unauthorized",
+        });
+      }
+
+      return new Response(
+        JSON.stringify({
+          name: "Fallback result",
+          document: { id: "0:0", type: "DOCUMENT", name: "Document", children: [] },
+        }),
+        { status: 200, statusText: "OK" },
+      );
+    }) as typeof fetch;
+
+    try {
+      const service = new FigmaService({
+        figmaApiKey: "first-key",
+        figmaOAuthToken: "",
+        useOAuth: false,
+        figmaApiKeys: ["first-key", "second-key"],
+      });
+
+      await service.getRawFile("ROTATION_TEST");
+
+      expect(seenKeys).toEqual(["first-key", "second-key"]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("falls back to the next PAT on quota limit 429", async () => {
+    const originalFetch = globalThis.fetch;
+    const seenKeys: string[] = [];
+
+    globalThis.fetch = jest.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const headers = init?.headers as Record<string, string>;
+      const key = headers?.["X-Figma-Token"] || "";
+      seenKeys.push(key);
+
+      if (key === "limited-key") {
+        return new Response(JSON.stringify({ status: 429 }), {
+          status: 429,
+          statusText: "Too Many Requests",
+        });
+      }
+
+      return new Response(
+        JSON.stringify({
+          name: "Quota fallback",
+          document: { id: "0:0", type: "DOCUMENT", name: "Document", children: [] },
+        }),
+        { status: 200, statusText: "OK" },
+      );
+    }) as typeof fetch;
+
+    try {
+      const service = new FigmaService({
+        figmaApiKey: "limited-key",
+        figmaOAuthToken: "",
+        useOAuth: false,
+        figmaApiKeys: ["limited-key", "available-key"],
+      });
+
+      await service.getRawFile("QUOTA_ROTATION_TEST");
+      expect(seenKeys).toEqual(["limited-key", "available-key"]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });
 function spyOnRequest() {
   return jest.spyOn(

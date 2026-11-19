@@ -19,6 +19,7 @@ export type FigmaAuthOptions = {
   figmaApiKey: string;
   figmaOAuthToken: string;
   useOAuth: boolean;
+  figmaApiKeys?: string[];
 };
 
 export type CacheInfo = {
@@ -31,7 +32,7 @@ export type PrepareFileResult = {
   wasCached: boolean; // 文件是否已缓存
   nodeExists?: boolean; // nodeId 是否存在（如果提供了 nodeId）
   action: "no-op" | "fetched" | "refreshed" | "cache-disabled"; // 执行的操作
-  message?: string; // 可选的详细消息
+  message?: string; // 可选的详细提示
 };
 
 type SvgOptions = {
@@ -41,7 +42,7 @@ type SvgOptions = {
 };
 
 export class FigmaService {
-  private readonly apiKey: string;
+  private readonly apiKeys: string[];
   private readonly oauthToken: string;
   private readonly useOAuth: boolean;
   private readonly baseUrl = "https://api.figma.com/v1";
@@ -49,12 +50,17 @@ export class FigmaService {
   private readonly nodeCache: LRUCache<string, GetFileNodesResponse>;
   private readonly NODE_CACHE_TTL = 5 * 60 * 1000; // 5 minutes TTL for node cache
   private readonly NODE_CACHE_MAX_SIZE = 50; // Maximum 50 nodes in memory
+  private nextApiKeyIndex = 0;
 
   constructor(
-    { figmaApiKey, figmaOAuthToken, useOAuth }: FigmaAuthOptions,
+    { figmaApiKey, figmaOAuthToken, useOAuth, figmaApiKeys }: FigmaAuthOptions,
     cachingOptions?: FigmaCachingOptions,
   ) {
-    this.apiKey = figmaApiKey || "";
+    const keys = figmaApiKeys && figmaApiKeys.length > 0
+      ? figmaApiKeys
+      : (figmaApiKey ? [figmaApiKey] : []);
+
+    this.apiKeys = [...new Set(keys.map((key) => key.trim()).filter(Boolean))];
     this.oauthToken = figmaOAuthToken || "";
     this.useOAuth = !!useOAuth && !!this.oauthToken;
     this.nodeCache = new LRUCache(this.NODE_CACHE_MAX_SIZE, this.NODE_CACHE_TTL);
@@ -63,14 +69,32 @@ export class FigmaService {
     }
   }
 
-  private getAuthHeaders(): Record<string, string> {
+  private maskKey(key: string): string {
+    return key.length <= 4 ? "****" : `****${key.slice(-4)}`;
+  }
+
+  private getAuthHeaders(apiKey?: string): Record<string, string> {
     if (this.useOAuth) {
       Logger.log("Using OAuth Bearer token for authentication");
       return { Authorization: `Bearer ${this.oauthToken}` };
-    } else {
-      Logger.log("Using Personal Access Token for authentication");
-      return { "X-Figma-Token": this.apiKey };
     }
+
+    const key = apiKey || this.apiKeys[this.nextApiKeyIndex % Math.max(this.apiKeys.length, 1)] || "";
+    if (key) {
+      Logger.log(`Using Personal Access Token ${this.maskKey(key)} for authentication`);
+    }
+    return key ? { "X-Figma-Token": key } : {};
+  }
+
+  private shouldTryNextKey(error: unknown): boolean {
+    if (this.useOAuth || this.apiKeys.length <= 1) return false;
+    const message = error instanceof Error ? error.message : String(error);
+    return /status (401|403|429)(?:\b|:)/i.test(message);
+  }
+
+  private getNextApiKeyIndex(currentIndex: number): number {
+    if (this.apiKeys.length === 0) return 0;
+    return (currentIndex + 1) % this.apiKeys.length;
   }
 
   /**
@@ -87,19 +111,48 @@ export class FigmaService {
   }
 
   private async request<T>(endpoint: string): Promise<T> {
-    try {
-      Logger.log(`Calling ${this.baseUrl}${endpoint}`);
-      const headers = this.getAuthHeaders();
+    const startIndex = this.apiKeys.length > 0
+      ? this.nextApiKeyIndex % this.apiKeys.length
+      : 0;
 
-      return await fetchWithRetry<T & { status?: number }>(`${this.baseUrl}${endpoint}`, {
-        headers,
-      });
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      throw new Error(
-        `Failed to make request to Figma API endpoint '${endpoint}': ${errorMessage}`,
-      );
+    for (let offset = 0; offset < (this.useOAuth ? 1 : Math.max(this.apiKeys.length, 1)); offset++) {
+      const keyIndex = this.apiKeys.length > 0
+        ? (startIndex + offset) % this.apiKeys.length
+        : 0;
+
+      try {
+        Logger.log(`Calling ${this.baseUrl}${endpoint}`);
+        const headers = this.getAuthHeaders(
+          this.useOAuth ? undefined : this.apiKeys[keyIndex],
+        );
+
+        const result = await fetchWithRetry<T & { status?: number }>(`${this.baseUrl}${endpoint}`, {
+          headers,
+        });
+
+        if (!this.useOAuth && this.apiKeys.length > 0) {
+          this.nextApiKeyIndex = this.getNextApiKeyIndex(keyIndex);
+        }
+        return result;
+      } catch (error) {
+        if (!this.shouldTryNextKey(error)) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          throw new Error(
+            `Failed to make request to Figma API endpoint '${endpoint}': ${errorMessage}`,
+          );
+        }
+
+        const nextIndex = this.getNextApiKeyIndex(keyIndex);
+        this.nextApiKeyIndex = nextIndex;
+        Logger.log(
+          `PAT ${this.maskKey(this.apiKeys[keyIndex] || "")} was rejected or rate-limited; trying PAT ${this.maskKey(this.apiKeys[nextIndex] || "")}`,
+        );
+      }
     }
+
+    throw new Error(
+      `Failed to make request to Figma API endpoint '${endpoint}': all configured PATs were rejected or rate-limited`,
+    );
   }
 
   /**
@@ -613,7 +666,12 @@ export class FigmaService {
   /**
    * Get cache statistics if caching is enabled
    */
-  async getCacheStats() {
+  async getCacheStats(): Promise<{
+    fileCount: number;
+    totalSizeBytes: number;
+    cacheDir: string;
+    ttlMs: number;
+  } | null> {
     if (!this.fileCache) {
       return null;
     }
